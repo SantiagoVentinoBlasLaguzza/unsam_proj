@@ -1,0 +1,19 @@
+# Ruta base del proyecto en Google Drive
+project_dir: "/content/drive/My Drive/UNSAM_alzheimer"
+
+# Nombre del archivo CSV que contiene la base de datos de sujetos
+csv_filename: "DataBaseSubjects.csv"
+
+# Directorio relativo al project_dir donde se encuentran los tensores
+tensor_data_dir: "TensorData"
+
+# Parámetros para la semilla aleatoria (para reproducibilidad)
+seed: 42
+
+# Parámetros para la carga en batch durante el entrenamiento y validación
+batch_size: 32
+
+# Proporciones para la división de datos
+train_ratio: 0.7
+val_ratio: 0.15
+test_ratio: 0.15
