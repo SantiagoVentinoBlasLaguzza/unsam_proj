@@ -22,6 +22,7 @@ import pickle
 import logging
 import argparse
 from typing import Tuple, List, Optional, Dict, Any
+from utils.utils import set_random_seed
 
 # For Google Colab drive mounting
 try:
@@ -83,18 +84,6 @@ def load_config(config_path: str) -> Dict[str, Any]:
     except Exception as e:
         logging.error(f"Failed to load config from {config_path}: {e}")
         sys.exit(1)
-
-
-def set_random_seed(seed: int) -> None:
-    """
-    Set the seed for reproducibility in numpy and torch.
-    
-    Args:
-        seed (int): Seed value.
-    """
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    logging.info(f"Random seed set to: {seed}")
 
 
 def load_subjects_dataframe(csv_path: str) -> pd.DataFrame:
