@@ -1,49 +1,31 @@
-#!/usr/bin/env python3
-"""
-latent_space.py
-
-This script:
-    1. Loads the trained BetaVAE model,
-    2. Loads the train, validation, and test datasets,
-    3. Encodes each sample to obtain its latent embedding,
-    4. Visualizes a random subject's original 3-channel tensor and its reconstruction (from each partition),
-    5. Projects latent space via PCA, t-SNE, and UMAP,
-    6. Plots the 2D projections with color-coded groups (AD, CN, Others)
-       and marker shapes for train, validation, test data.
-
-Usage:
-    python latent_space.py --project_dir /path/to/project --latent_dim 250 --beta 0.5
-"""
-
 import os
 import sys
 import logging
 import argparse
 import random
-from typing import Tuple, List
-
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
+import plotly.express as px
 import torch.nn.functional as F
-from torch.utils.data import TensorDataset, DataLoader
+from typing import Tuple, List
 import matplotlib.pyplot as plt
 import umap
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 
-# ----------------------
-# Optional: If BetaVAE is in another file, adjust the import accordingly.
-# Here, we define BetaVAE inline for completeness.
-# ----------------------
+
 class BetaVAE(nn.Module):
-    def __init__(self, latent_dim=250, hidden_dim=1024, beta=0.1, dropout_rate=0.01):
+    def __init__(self, latent_dim=250, hidden_dim=1024, beta=3.5, dropout_rate=0.01):
         super(BetaVAE, self).__init__()
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
         self.beta = beta
 
-        # Encoder
+        # -------------------
+        #    Encoder
+        # -------------------
         self.enc_conv1 = nn.Conv2d(3, 32, kernel_size=4, stride=2, padding=1)
         self.enc_bn1 = nn.BatchNorm2d(32)
         self.enc_conv2 = nn.Conv2d(32, 64, 4, 2, 1)
@@ -53,16 +35,19 @@ class BetaVAE(nn.Module):
         self.enc_conv4 = nn.Conv2d(128, 256, 4, 2, 1)
         self.enc_bn4 = nn.BatchNorm2d(256)
 
-        # After 4 downsamples, for 112x112-ish inputs -> ~7x7
+        # After 4 downsamples (stride=2 each time),
+        # for a ~112x112 input -> ~7x7 feature map
         self.flatten_size = 256 * 7 * 7
 
         self.fc1 = nn.Linear(self.flatten_size, self.hidden_dim)
         self.fc_bn1 = nn.BatchNorm1d(self.hidden_dim)
-        self.fc_mu = nn.Linear(self.hidden_dim, latent_dim)
-        self.fc_logvar = nn.Linear(self.hidden_dim, latent_dim)
+        self.fc_mu = nn.Linear(self.hidden_dim, self.latent_dim)
+        self.fc_logvar = nn.Linear(self.hidden_dim, self.latent_dim)
 
-        # Decoder
-        self.fc_decode = nn.Linear(latent_dim, self.hidden_dim)
+        # -------------------
+        #    Decoder
+        # -------------------
+        self.fc_decode = nn.Linear(self.latent_dim, self.hidden_dim)
         self.fc_bn2 = nn.BatchNorm1d(self.hidden_dim)
         self.fc_decode2 = nn.Linear(self.hidden_dim, self.flatten_size)
 
@@ -93,7 +78,7 @@ class BetaVAE(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    def decode(self, z: torch.Tensor, target_size: Tuple[int, int] = (116, 116)) -> torch.Tensor:
+    def decode(self, z: torch.Tensor, target_size: Tuple[int, int] = (112, 112)) -> torch.Tensor:
         x = torch.tanh(self.fc_bn2(self.fc_decode(z)))
         x = torch.tanh(self.fc_decode2(x))
         x = x.view(z.size(0), 256, 7, 7)
@@ -107,24 +92,15 @@ class BetaVAE(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
-        target_size = (x.size(-2), x.size(-1))  # match input spatial dims
+        # Match the reconstructed size to the input
+        target_size = (x.size(-2), x.size(-1))
         recon_x = self.decode(z, target_size=target_size)
         return recon_x, mu, logvar, z
 
 
-def zero_diagonals(tensor: torch.Tensor) -> torch.Tensor:
-    """
-    Utility to zero out diagonals in each channel if needed.
-    """
-    if tensor.size(1) == tensor.size(2):
-        idx = torch.arange(tensor.size(1), device=tensor.device)
-        tensor[:, idx, idx] = 0
-    return tensor
-
-
 def load_partition_data(project_dir: str, partition_name: str) -> torch.Tensor:
     """
-    Loads a .pt file containing the partition data (train, val, or test).
+    Loads a .pt file containing partition data (train, val, or test).
     """
     file_path = os.path.join(project_dir, f"{partition_name}_data.pt")
     logging.info(f"Loading {partition_name} data from {file_path} ...")
@@ -136,188 +112,183 @@ def load_partition_data(project_dir: str, partition_name: str) -> torch.Tensor:
     return data
 
 
-def random_subject_visualization(
-    model: nn.Module,
+def map_group_to_three_categories(group: str) -> str:
+    """
+    Map original ResearchGroup to one of three categories:
+      - 'AD'
+      - 'CN'
+      - 'Others' (includes 'MCI', 'LMCI', 'EMCI', or anything else)
+    """
+    group_upper = group.strip().upper()
+    if group_upper == 'AD':
+        return 'AD'
+    elif group_upper == 'CN':
+        return 'CN'
+    else:
+        # For MCI, LMCI, EMCI, etc., return 'Others'
+        return 'Others'
+
+
+def load_subject_metadata(csv_path: str):
+    """
+    Loads SubjectID, ResearchGroup, Sex, and Age from a CSV.
+    Then maps ResearchGroup into AD, CN, or Others.
+    
+    Assumes the CSV has columns:
+        - SubjectID
+        - ResearchGroup
+        - Sex
+        - Age
+    """
+    df = pd.read_csv(csv_path)
+    metadata = {}
+    for _, row in df.iterrows():
+        # Map the group into the 3 categories:
+        new_group = map_group_to_three_categories(row['ResearchGroup'])
+
+        metadata[row['SubjectID']] = {
+            'Group': new_group,       # AD, CN, or Others
+            'Sex': row['Sex'],
+            'Age': row['Age']
+        }
+    return metadata
+
+
+def get_latent_embeddings_with_labels(
+    model: BetaVAE,
     data: torch.Tensor,
-    partition_name: str,
+    subject_ids: List[str],
+    subject_metadata: dict,
     device: torch.device
-) -> None:
-    """
-    Pick a random subject from the given partition (train, val, or test),
-    plot the 3-channel input and its reconstruction.
-    """
-    if data is None or data.size(0) == 0:
-        logging.warning(f"No data found in {partition_name} partition.")
-        return
-
-    model.eval()
-    idx = random.randint(0, data.size(0) - 1)
-    sample = data[idx:idx+1].to(device, dtype=torch.float)  # shape (1, 3, H, W)
-    with torch.no_grad():
-        recon, _, _, _ = model(sample)
-
-    # Move to CPU and numpy for plotting
-    sample_np = sample.cpu().numpy()[0]   # shape (3, H, W)
-    recon_np = recon.cpu().numpy()[0]     # shape (3, H, W)
-
-    # Plot
-    fig, axes = plt.subplots(2, 3, figsize=(12, 6))
-    for j in range(3):
-        axes[0, j].imshow(sample_np[j], cmap='viridis')
-        axes[0, j].set_title(f'{partition_name} Original - Matrix {j+1}')
-        axes[0, j].axis('off')
-
-        axes[1, j].imshow(recon_np[j], cmap='viridis')
-        axes[1, j].set_title(f'{partition_name} Reconstructed - Matrix {j+1}')
-        axes[1, j].axis('off')
-    plt.tight_layout()
-    plt.show()
-
-
-def get_latent_embeddings(
-    model: nn.Module,
-    data: torch.Tensor,
-    device: torch.device
-) -> torch.Tensor:
-    """
-    Pass the entire dataset through the encoder, returning mu (or z).
-    Return shape: (N, latent_dim).
-    """
-    model.eval()
-    batch_size = 32
-    embeddings = []
-    for start in range(0, data.size(0), batch_size):
-        end = start + batch_size
-        batch = data[start:end].to(device, dtype=torch.float)
-        with torch.no_grad():
-            mu, logvar = model.encode(batch)
-            # Option 1: Use mu as embedding
-            # Option 2: Reparameterize to get z
-            # z = model.reparameterize(mu, logvar)
-        embeddings.append(mu.cpu())  # shape (batch_size, latent_dim)
-    return torch.cat(embeddings, dim=0)
-
-
-def plot_2d_projection(
-    embedding_2d: np.ndarray,
-    groups: List[str],
-    partitions: List[str],
-    title: str
 ):
     """
-    Plot the 2D embedding (PCA, t-SNE, or UMAP) with color by group and marker by partition.
-    embedding_2d: (N, 2) array
-    groups: list of group labels ('AD', 'CN', 'Other') per point
-    partitions: list of partition labels ('train', 'val', 'test') per point
+    Pass each sample through the encoder to get latent embeddings (mu).
+    Also extract the 'Group', 'Sex', and 'Age' from subject_metadata.
     """
-    plt.figure(figsize=(8, 6))
+    model.eval()
+    embeddings = []
+    group_labels = []
+    sex_labels = []
+    age_values = []
+    subj_ids = []
 
-    # Define color + marker mapping
-    color_map = {'AD': 'red', 'CN': 'blue', 'Other': 'green'}
-    marker_map = {'train': 'o', 'val': 's', 'test': '^'}
+    for i in range(len(data)):
+        sample = data[i:i+1].to(device, dtype=torch.float)
+        with torch.no_grad():
+            mu, _ = model.encode(sample)
+        embeddings.append(mu.cpu().numpy())
 
-    for group_label, partition_label, (x, y) in zip(groups, partitions, embedding_2d):
-        c = color_map.get(group_label, 'gray')
-        m = marker_map.get(partition_label, 'x')
-        plt.scatter(x, y, c=c, marker=m, alpha=0.7, edgecolors='k', linewidths=0.5)
+        # Retrieve metadata
+        subj_id = subject_ids[i]
+        meta = subject_metadata.get(subj_id, {'Group': 'Others', 'Sex': 'Unknown', 'Age': -1})
+        group_labels.append(meta['Group'])
+        sex_labels.append(meta['Sex'])
+        age_values.append(meta['Age'])
+        subj_ids.append(subj_id)
 
-    plt.title(title)
-    plt.xlabel("Dim 1")
-    plt.ylabel("Dim 2")
-    plt.grid(True)
-    plt.show()
+    return (
+        np.vstack(embeddings),
+        group_labels,
+        sex_labels,
+        age_values,
+        subj_ids
+    )
+
+
+def plot_2d_projection_with_labels(
+    embedding_2d,
+    group_labels,
+    sex_labels,
+    age_values,
+    subj_ids,
+    title
+):
+    """
+    Create an interactive 2D scatter plot of the embeddings using Plotly.
+    - Color by the 3-category group (AD, CN, Others)
+    - Hover shows SubjectID, Sex, and Age
+    """
+    fig = px.scatter(
+        x=embedding_2d[:, 0],
+        y=embedding_2d[:, 1],
+        color=group_labels,  # This is AD, CN, or Others
+        hover_data={
+            "SubjectID": subj_ids,
+            "Sex": sex_labels,
+            "Age": age_values
+        },
+        labels={"x": "Dim 1", "y": "Dim 2"},
+        title=title
+    )
+    fig.update_traces(marker=dict(size=8, opacity=0.7))
+    fig.show()
 
 
 def main(args):
+    # Configure logging
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Using device: {device}")
 
-    #project_dir = args.project_dir
-    project_dir = "/content/drive/My Drive/UNSAM_alzheimer/"
-    model_path = os.path.join(project_dir, "best_beta_vae_model.pth")
+    # 1. Load subject metadata (mapped to AD, CN, or Others)
+    csv_path = os.path.join(args.project_dir, 'DataBaseSubjects.csv')
+    subject_metadata = load_subject_metadata(csv_path)
 
-    # 1) Load the BetaVAE model
+    # 2. Load trained BetaVAE model
+    model_path = os.path.join(args.project_dir, "best_beta_vae_model.pth")
     model = BetaVAE(latent_dim=args.latent_dim, beta=args.beta)
-    logging.info(f"Loading model from {model_path}")
-    try:
-        model.load_state_dict(torch.load(model_path, map_location=device))
-        model.to(device)
-        model.eval()
-        logging.info("Model loaded successfully.")
-    except Exception as e:
-        logging.error(f"Error loading BetaVAE model: {e}")
-        sys.exit(1)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.to(device)
+    model.eval()
 
-    # 2) Load train, val, test data
-    train_data = load_partition_data(project_dir, "train")
-    val_data = load_partition_data(project_dir, "val")
-    test_data = load_partition_data(project_dir, "test")
+    # 3. Load data partitions
+    train_data = load_partition_data(args.project_dir, "train")
+    val_data = load_partition_data(args.project_dir, "val")
+    test_data = load_partition_data(args.project_dir, "test")
 
-    # Optionally, zero out diagonals if you did that in preprocessing
-    # train_data = zero_diagonals(train_data)
-    # val_data   = zero_diagonals(val_data)
-    # test_data  = zero_diagonals(test_data)
-
-    # 3) Visual Comparison for one subject in each partition
-    random_subject_visualization(model, train_data, "Train", device)
-    random_subject_visualization(model, val_data, "Validation", device)
-    random_subject_visualization(model, test_data, "Test", device)
-
-    # 4) Obtain latent embeddings (mu or z) for all data
-    #    Suppose we also have group labels for each row, e.g. from a CSV or saved list.
-    #    Below we create dummy group labels for illustration.
-    #    Real code: load your actual group labels here.
-    train_size = train_data.size(0)
-    val_size = val_data.size(0)
-    test_size = test_data.size(0)
-
-    # Example: label vectors
-    # Suppose AD=0, CN=1, Other=2 in your data. Convert to strings for plotting:
-    # Or read from a stored array if you have them. Must match data ordering.
-    # For demonstration, we'll assign random groups:
-    group_labels_train = [random.choice(['AD', 'CN', 'Other']) for _ in range(train_size)]
-    group_labels_val = [random.choice(['AD', 'CN', 'Other']) for _ in range(val_size)]
-    group_labels_test = [random.choice(['AD', 'CN', 'Other']) for _ in range(test_size)]
-
-    partition_labels_train = ["train"] * train_size
-    partition_labels_val = ["val"] * val_size
-    partition_labels_test = ["test"] * test_size
-
-    # Concatenate all data to embed them together
+    # Concatenate all samples
     all_data = torch.cat([train_data, val_data, test_data], dim=0)
-    all_partition_labels = partition_labels_train + partition_labels_val + partition_labels_test
-    all_group_labels = group_labels_train + group_labels_val + group_labels_test
 
-    # Encode to get embeddings
-    all_embeddings = get_latent_embeddings(model, all_data, device)
-    # all_embeddings shape: (N, latent_dim)
+    # 4. Build list of subject IDs (must match the data order!)
+    subject_ids = list(subject_metadata.keys())[:len(all_data)]
 
-    # 5) Dimensionality reductions: PCA, t-SNE, UMAP
-    all_embeddings_np = all_embeddings.numpy()
+    # 5. Extract latent embeddings + metadata labels
+    (
+        embeddings,
+        group_labels,
+        sex_labels,
+        age_values,
+        subj_ids
+    ) = get_latent_embeddings_with_labels(
+        model, all_data, subject_ids, subject_metadata, device
+    )
 
-    # --- PCA ---
-    pca = PCA(n_components=2, random_state=42)
-    pca_2d = pca.fit_transform(all_embeddings_np)
-    plot_2d_projection(pca_2d, all_group_labels, all_partition_labels, title="PCA Projection")
+    # 6. Compute 2D projections (PCA, t-SNE, UMAP)
+    pca_2d = PCA(n_components=2).fit_transform(embeddings)
+    tsne_2d = TSNE(n_components=2, perplexity=30).fit_transform(embeddings)
+    umap_2d = umap.UMAP(n_components=2).fit_transform(embeddings)
 
-    # --- t-SNE ---
-    tsne = TSNE(n_components=2, perplexity=30, random_state=42)
-    tsne_2d = tsne.fit_transform(all_embeddings_np)
-    plot_2d_projection(tsne_2d, all_group_labels, all_partition_labels, title="t-SNE Projection")
-
-    # --- UMAP ---
-    reducer = umap.UMAP(n_components=2, random_state=42)
-    umap_2d = reducer.fit_transform(all_embeddings_np)
-    plot_2d_projection(umap_2d, all_group_labels, all_partition_labels, title="UMAP Projection")
+    # 7. Plot each projection with color-coded groups (AD, CN, Others)
+    plot_2d_projection_with_labels(
+        pca_2d, group_labels, sex_labels, age_values, subj_ids,
+        "PCA Projection (AD, CN, Others)"
+    )
+    plot_2d_projection_with_labels(
+        tsne_2d, group_labels, sex_labels, age_values, subj_ids,
+        "t-SNE Projection (AD, CN, Others)"
+    )
+    plot_2d_projection_with_labels(
+        umap_2d, group_labels, sex_labels, age_values, subj_ids,
+        "UMAP Projection (AD, CN, Others)"
+    )
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Analyze and visualize BetaVAE latent space.")
-    parser.add_argument("--project_dir", type=str, default="./", help="Project directory path")
-    parser.add_argument("--latent_dim", type=int, default=250, help="Latent dimension size (must match trained model)")
-    parser.add_argument("--beta", type=float, default=0.1, help="Beta coefficient for VAE loss (must match trained model)")
+    parser = argparse.ArgumentParser(description="Analyze BetaVAE latent space with AD/CN/Others color-coding.")
+    parser.add_argument("--project_dir", type=str, required=True, help="Project directory path")
+    parser.add_argument("--latent_dim", type=int, default=250, help="Latent dimension size")
+    parser.add_argument("--beta", type=float, default=0.1, help="Beta coefficient for VAE loss")
     args = parser.parse_args()
-
     main(args)
+
